@@ -321,17 +321,20 @@ class ACT(nn.Module):
                 create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
             )
 
-        # Backbone for image feature extraction.
+        # Backbones for image feature extraction: one per camera, trained independently but all
+        # initialized from the same pretrained weights. The attribute name must keep the "backbone"
+        # prefix: ACTPolicy.get_optim_params selects these params via `n.startswith("model.backbone")`.
+        # Old checkpoints store a single shared `backbone.*`; see `migrate_legacy_backbone_state_dict`.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
+            backbone_models = [self._build_backbone_model(config) for _ in self.config.image_features]
+            backbone_feat_dim = backbone_models[0].fc.in_features
             # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
             # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            # Note: The forward method of each backbone returns a dict: {"feature_map": output}.
+            self.backbones = nn.ModuleList(
+                IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+                for backbone_model in backbone_models
+            )
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -349,9 +352,8 @@ class ACT(nn.Module):
             )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
-            self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
-            )
+            # Shared across cameras (matching the original ACT repo), unlike the backbones.
+            self.encoder_img_feat_input_proj = nn.Conv2d(backbone_feat_dim, config.dim_model, kernel_size=1)
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
@@ -370,6 +372,32 @@ class ACT(nn.Module):
         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
 
         self._reset_parameters()
+
+    @staticmethod
+    def _build_backbone_model(config: ACTConfig) -> nn.Module:
+        """Build one torchvision vision backbone (identically for every camera)."""
+        return getattr(torchvision.models, config.vision_backbone)(
+            replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+            weights=config.pretrained_backbone_weights,
+            norm_layer=FrozenBatchNorm2d,
+        )
+
+    @staticmethod
+    def migrate_legacy_backbone_state_dict(state_dict: dict, num_cameras: int) -> dict:
+        """Convert a checkpoint from before per-camera backbones (a single shared `backbone.*`).
+
+        Copies the legacy shared backbone weights into every `backbones.{i}.*` entry. Works on both
+        `ACT` (`backbone.*`) and `ACTPolicy` (`model.backbone.*`) state dicts.
+        """
+        migrated = {}
+        for key, value in state_dict.items():
+            if ".backbone." in f".{key}":
+                prefix, rest = key.split("backbone.", 1)
+                for cam_idx in range(num_cameras):
+                    migrated[f"{prefix}backbones.{cam_idx}.{rest}"] = value.clone()
+            else:
+                migrated[key] = value
+        return migrated
 
     def _reset_parameters(self):
         """Xavier-uniform initialization of the transformer parameters as in the original code."""
@@ -471,8 +499,10 @@ class ACT(nn.Module):
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
+            # Camera order in batch[OBS_IMAGES] follows the config's image keys and is stable, so
+            # positional indexing selects each camera's dedicated backbone.
+            for cam_idx, img in enumerate(batch[OBS_IMAGES]):
+                cam_features = self.backbones[cam_idx](img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
