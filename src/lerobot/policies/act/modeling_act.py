@@ -323,12 +323,14 @@ class ACT(nn.Module):
                 create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
             )
 
-        # Backbones for image feature extraction: one per camera, trained independently but all
-        # initialized from the same pretrained weights. The attribute name must keep the "backbone"
-        # prefix: ACTPolicy.get_optim_params selects these params via `n.startswith("model.backbone")`.
+        # Backbones for image feature extraction: one per camera when `separate_backbones`, trained
+        # independently but all initialized from the same pretrained weights; otherwise a single
+        # backbone shared by every camera. The attribute name must keep the "backbone" prefix:
+        # ACTPolicy.get_optim_params selects these params via `n.startswith("model.backbone")`.
         # Old checkpoints store a single shared `backbone.*`; see `migrate_legacy_backbone_state_dict`.
         if self.config.image_features:
-            backbone_models = [self._build_backbone_model(config) for _ in self.config.image_features]
+            num_backbones = len(self.config.image_features) if config.separate_backbones else 1
+            backbone_models = [self._build_backbone_model(config) for _ in range(num_backbones)]
             backbone_feat_dim = backbone_models[0].fc.in_features
             # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
             # feature map).
@@ -504,7 +506,8 @@ class ACT(nn.Module):
             # Camera order in batch[OBS_IMAGES] follows the config's image keys and is stable, so
             # positional indexing selects each camera's dedicated backbone.
             for cam_idx, img in enumerate(batch[OBS_IMAGES]):
-                cam_features = self.backbones[cam_idx](img)["feature_map"]
+                backbone = self.backbones[cam_idx if self.config.separate_backbones else 0]
+                cam_features = backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
