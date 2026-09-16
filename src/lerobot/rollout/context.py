@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from lerobot.configs import FeatureType, PreTrainedConfig
+from lerobot.configs.types import PolicyFeature
 from lerobot.datasets import (
     LeRobotDataset,
     aggregate_pipeline_dataset_features,
@@ -345,10 +346,12 @@ def build_rollout_context(
     # x/y/theta.vel) and the policy was trained/normalized on all 9; the old .pos-only
     # filter fed a 6-dim state into a 9-dim normalizer → RuntimeError (size 6 vs 9).
     # Pure-arm robots have no .vel state keys, so this is a no-op for them.
+    # ``PolicyFeature`` values (e.g. the ENV-typed tactile array of so101_follower_touch) are
+    # kept as-is; hw_to_dataset_features routes them to observation.environment_state.
     observation_features_hw = {
         k: v
         for k, v in all_obs_features.items()
-        if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".vel")))
+        if isinstance(v, (tuple, PolicyFeature)) or (v is float and k.endswith((".pos", ".vel")))
     }
     # Keep both joint-position (.pos) and base-velocity (.vel) action features so
     # mobile manipulators command the base too (e.g. LeKiwi: 6 arm .pos +
