@@ -37,6 +37,22 @@ def _is_scalar(x):
     )
 
 
+def _heatmap_rgb(arr: np.ndarray, floor: float = 100.0, upscale: int = 24) -> np.ndarray:
+    """Render a 2-D array as an RGB heatmap: negative = red, zero = grey, positive = blue.
+
+    Matches the CTS touch web page (a touch is a negative blob). The colour scale autoscales to
+    the frame's max |value| but never below ``floor`` (env ``LEROBOT_HEATMAP_FLOOR``), so idle
+    sensor noise stays grey instead of blowing up to full saturation.
+    """
+    a = np.asarray(arr, dtype=np.float32)
+    scale = max(float(np.abs(a).max()), float(os.getenv("LEROBOT_HEATMAP_FLOOR", floor)))
+    t = np.clip(a / scale, -1.0, 1.0)[..., None]
+    neg, mid, pos = (np.array(c, dtype=np.float32) for c in ((230, 103, 103), (56, 56, 53), (57, 135, 229)))
+    rgb = np.where(t < 0, mid + (neg - mid) * (-t), mid + (pos - mid) * t)
+    rgb = np.repeat(np.repeat(rgb, upscale, axis=0), upscale, axis=1)
+    return rgb.astype(np.uint8)
+
+
 def init_rerun(
     session_name: str = "lerobot_control_loop", ip: str | None = None, port: int | None = None
 ) -> None:
@@ -160,6 +176,11 @@ def log_rerun_data(
                 if arr.ndim == 1:
                     rr.log(key, rr.Scalars(arr.astype(float)))
                     observation_paths.add(key)
+                elif arr.ndim == 3 and arr.shape[-1] not in (1, 3, 4):
+                    # Stacked non-image grids, e.g. tactile arrays (S, H, W) -> one heatmap per sheet.
+                    for i, sheet in enumerate(arr):
+                        rr.log(f"{key}/{i}", rr.Image(_heatmap_rgb(sheet)), static=True)
+                        image_paths.add(f"{key}/{i}")
                 else:
                     if arr.shape[-1] == 1:
                         # At record time, the depth unit is inferred from the frame type.

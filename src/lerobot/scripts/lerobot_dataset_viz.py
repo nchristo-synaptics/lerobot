@@ -86,7 +86,7 @@ import tqdm
 
 from lerobot.configs import DEPTH_MILLIMETER_UNIT
 from lerobot.datasets import LeRobotDataset
-from lerobot.utils.constants import ACTION, DONE, OBS_STATE, REWARD, SUCCESS
+from lerobot.utils.constants import ACTION, DONE, OBS_ENV_STATE, OBS_STATE, REWARD, SUCCESS
 from lerobot.utils.utils import init_logging
 
 logger = logging.getLogger(__name__)
@@ -154,7 +154,45 @@ def build_blueprint_from_dataset(dataset: LeRobotDataset):
         if key in dataset.features:
             views.append(rrb.TimeSeriesView(origin=key, name=key))
 
+    if OBS_ENV_STATE in dataset.features:
+        layout = env_state_layout(dataset)
+        if layout:
+            for name, shape in layout.items():
+                for i in range(shape[0] if len(shape) == 3 else 1):
+                    path = f"env/{name}/{i}" if len(shape) == 3 else f"env/{name}"
+                    views.append(rrb.Spatial2DView(origin=path, name=path))
+        else:
+            views.append(rrb.TimeSeriesView(origin="env", name="env"))
+
     return rrb.Blueprint(rrb.Grid(*views))
+
+
+def env_state_layout(dataset: LeRobotDataset) -> dict[str, list[int]]:
+    """Per-source shapes recorded by hw_to_dataset_features (``info.layout``), if any."""
+    return dataset.features[OBS_ENV_STATE].get("info", {}).get("layout", {}) or {}
+
+
+def log_env_state(vec: np.ndarray, layout: dict[str, list[int]]) -> None:
+    """Draw 2-D/3-D env-state sources as heatmaps (tactile arrays), else plot the vector."""
+    import rerun as rr
+
+    from lerobot.utils.rerun_visualization import _heatmap_rgb
+
+    if not layout:
+        rr.log("env", rr.Scalars(vec))
+        return
+    pos = 0
+    for name, shape in layout.items():
+        n = int(np.prod(shape))
+        chunk = vec[pos : pos + n].reshape(shape)
+        pos += n
+        if chunk.ndim == 3:
+            for i, sheet in enumerate(chunk):
+                rr.log(f"env/{name}/{i}", rr.Image(_heatmap_rgb(sheet)))
+        elif chunk.ndim == 2:
+            rr.log(f"env/{name}", rr.Image(_heatmap_rgb(chunk)))
+        else:
+            rr.log(f"env/{name}", rr.Scalars(chunk))
 
 
 def visualize_dataset(
@@ -213,6 +251,7 @@ def visualize_dataset(
 
     spawn_local_viewer = mode == "local" and not save
     blueprint = build_blueprint_from_dataset(dataset)
+    env_layout = env_state_layout(dataset) if OBS_ENV_STATE in dataset.features else {}
     rr.init(f"{repo_id}/episode_{episode_index}", spawn=spawn_local_viewer, default_blueprint=blueprint)
 
     # Manually call python garbage collector after `rr.init` to avoid hanging in a blocking flush
@@ -277,6 +316,9 @@ def visualize_dataset(
             # display the observed state space (e.g. agent position in joint space)
             if OBS_STATE in batch:
                 rr.log("state", rr.Scalars(batch[OBS_STATE][i].numpy()))
+
+            if OBS_ENV_STATE in batch:
+                log_env_state(batch[OBS_ENV_STATE][i].numpy(), env_layout)
 
             if DONE in batch:
                 rr.log(DONE, rr.Scalars(batch[DONE][i].item()))

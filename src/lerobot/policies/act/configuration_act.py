@@ -95,6 +95,16 @@ class ACTConfig(PreTrainedConfig):
         }
     )
 
+    # Environment-state (e.g. tactile array) path. When `env_state_layout` is set to (sensors, rows, cols),
+    # the flat env-state vector is reshaped and encoded by a small conv stem into `env_state_tokens`
+    # (rows, cols) pooled tokens per sensor with 2-D positional embeddings, instead of one linear token.
+    # Auto-filled from the dataset's `observation.environment_state.info.layout` when a single 3-D source exists.
+    env_state_layout: tuple[int, int, int] | None = None
+    env_state_tokens: tuple[int, int] = (2, 4)
+    env_state_stem_channels: int = 32
+    # Fixed input scale (sensor counts) so all cells share one scale; ENV normalization stays IDENTITY.
+    env_state_scale: float = 512.0
+
     # Architecture.
     # Vision backbone.
     vision_backbone: str = "resnet18"
@@ -165,6 +175,16 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+
+    def set_dataset_feature_metadata(self, features: dict) -> None:
+        """Pick up the env-state layout recorded by `hw_to_dataset_features` (called by make_policy)."""
+        if self.env_state_layout is not None:
+            return
+        layout = ((features.get("observation.environment_state") or {}).get("info") or {}).get("layout") or {}
+        if len(layout) == 1:
+            shape = next(iter(layout.values()))
+            if len(shape) == 3:
+                self.env_state_layout = tuple(int(d) for d in shape)
 
     @property
     def observation_delta_indices(self) -> None:

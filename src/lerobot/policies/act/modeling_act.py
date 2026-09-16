@@ -351,9 +351,12 @@ class ACT(nn.Module):
                 self.config.robot_state_feature.shape[0], config.dim_model
             )
         if self.config.env_state_feature:
-            self.encoder_env_state_input_proj = nn.Linear(
-                self.config.env_state_feature.shape[0], config.dim_model
-            )
+            if self.config.env_state_layout:
+                self.encoder_env_state_stem = ACTEnvStateStem(config)
+            else:
+                self.encoder_env_state_input_proj = nn.Linear(
+                    self.config.env_state_feature.shape[0], config.dim_model
+                )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             # Shared across cameras (matching the original ACT repo), unlike the backbones.
@@ -362,7 +365,7 @@ class ACT(nn.Module):
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
             n_1d_tokens += 1
-        if self.config.env_state_feature:
+        if self.config.env_state_feature and not self.config.env_state_layout:
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
@@ -495,9 +498,14 @@ class ACT(nn.Module):
         # Robot state token.
         if self.config.robot_state_feature:
             encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
-        # Environment state token.
+        # Environment state: one linear token, or a few spatial tokens per sensor (see ACTEnvStateStem).
         if self.config.env_state_feature:
-            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+            if self.config.env_state_layout:
+                env_tokens, env_pos_embed = self.encoder_env_state_stem(batch[OBS_ENV_STATE])
+                encoder_in_tokens.extend(list(env_tokens))
+                encoder_in_pos_embed.extend(list(env_pos_embed))
+            else:
+                encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.
@@ -716,6 +724,46 @@ def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tenso
     sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
     sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
     return torch.from_numpy(sinusoid_table).float()
+
+
+class ACTEnvStateStem(nn.Module):
+    """Spatial encoder for a grid-shaped environment state such as a tactile array.
+
+    Input is the flat env-state vector (B, S*H*W) laid out as `config.env_state_layout` = (S, H, W).
+    Each sensor sheet is scaled by a fixed constant, passed through two 3x3 convolutions (weights shared
+    across sensors), average-pooled to `config.env_state_tokens` (h, w) and projected to dim_model, giving
+    S*h*w encoder tokens. Positional embeddings are the same 2-D sinusoidal ones the camera feature maps
+    use, plus a learned per-sensor embedding so identical grids on different sensors stay distinguishable.
+    """
+
+    def __init__(self, config: ACTConfig):
+        super().__init__()
+        self.layout = tuple(config.env_state_layout)
+        self.scale = float(config.env_state_scale)
+        ch = config.env_state_stem_channels
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, ch, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(ch, ch, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(tuple(config.env_state_tokens))
+        self.proj = nn.Conv2d(ch, config.dim_model, kernel_size=1)
+        self.pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
+        self.sensor_embed = nn.Embedding(self.layout[0], config.dim_model)
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        """Returns tokens (S*h*w, B, D) and positional embeddings (S*h*w, 1, D)."""
+        n_sensors, rows, cols = self.layout
+        batch_size = x.shape[0]
+        sheets = x.reshape(batch_size * n_sensors, 1, rows, cols) / self.scale
+        feat = self.proj(self.pool(self.conv(sheets)))  # (B*S, D, h, w)
+        pos = self.pos_embed(feat).to(dtype=feat.dtype)[0]  # (D, h, w)
+        pos = pos.unsqueeze(0) + self.sensor_embed.weight[:, :, None, None]  # (S, D, h, w)
+        feat = feat.reshape(batch_size, n_sensors, *feat.shape[1:])
+        tokens = einops.rearrange(feat, "b s d h w -> (s h w) b d")
+        pos = einops.rearrange(pos.unsqueeze(0), "b s d h w -> (s h w) b d")
+        return tokens, pos
 
 
 class ACTSinusoidalPositionEmbedding2d(nn.Module):

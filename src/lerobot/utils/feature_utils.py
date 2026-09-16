@@ -69,7 +69,15 @@ def hw_to_dataset_features(
     joint_fts = {
         key: ftype
         for key, ftype in hw_features.items()
-        if ftype is float or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
+        if ftype is float
+        or (isinstance(ftype, PolicyFeature) and ftype.type not in (FeatureType.VISUAL, FeatureType.ENV))
+    }
+    # ENV-typed features (e.g. tactile arrays) get their own key, which policies such as ACT
+    # consume as a separate encoder token rather than as part of the proprioceptive state.
+    env_fts = {
+        key: ftype
+        for key, ftype in hw_features.items()
+        if isinstance(ftype, PolicyFeature) and ftype.type == FeatureType.ENV
     }
     # TODO(CarolinePascal): we should not rely on the shape to determine if a feature is a camera !
     cam_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple)}
@@ -86,6 +94,16 @@ def hw_to_dataset_features(
             "dtype": "float32",
             "shape": (len(joint_fts),),
             "names": list(joint_fts),
+        }
+
+    if env_fts and prefix == OBS_STR:
+        names = [f"{key}.{i}" for key, ft in env_fts.items() for i in range(int(np.prod(ft.shape)))]
+        features[OBS_ENV_STATE] = {
+            "dtype": "float32",
+            "shape": (len(names),),
+            "names": names,
+            # Original per-source shapes, so visualizers can draw e.g. a tactile array as a heatmap.
+            "info": {"layout": {key: list(ft.shape) for key, ft in env_fts.items()}},
         }
 
     for key, shape in cam_fts.items():
@@ -128,6 +146,12 @@ def build_dataset_frame(
     for key, ft in ds_features.items():
         if key in DEFAULT_FEATURES or not key.startswith(prefix):
             continue
+        elif key == OBS_ENV_STATE:
+            # names are "<hw_key>.<i>": flatten each source array in order.
+            sources = list(dict.fromkeys(n.rsplit(".", 1)[0] for n in ft["names"]))
+            frame[key] = np.concatenate(
+                [np.asarray(values[src], dtype=np.float32).reshape(-1) for src in sources]
+            )
         elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
             frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
         elif ft["dtype"] in ["image", "video"]:
@@ -228,6 +252,8 @@ def combine_feature_dicts(*dicts: dict) -> dict:
                         seen.add(n)
                 # Recompute the shape to reflect the updated number of features
                 target["shape"] = (len(target["names"]),)
+                if value.get("info"):
+                    target["info"] = {**(target.get("info") or {}), **value["info"]}
             else:
                 # For images/videos and non-1D entries: override with the latest definition
                 out[key] = value

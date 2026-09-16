@@ -42,6 +42,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .so_follower import SO101Follower
 
         return SO101Follower(config)
+    elif config.type == "so101_follower_touch":
+        from .so_follower_touch import SO101FollowerTouch
+
+        return SO101FollowerTouch(config)
     elif config.type == "lekiwi":
         from .lekiwi import LeKiwi
 

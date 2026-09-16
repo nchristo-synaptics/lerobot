@@ -68,6 +68,7 @@ from lerobot.robots import (  # noqa: F401
     reachy2,
     rebot_b601_follower,
     so_follower,
+    so_follower_touch,
     unitree_g1,
 )
 from lerobot.utils.constants import ACTION
