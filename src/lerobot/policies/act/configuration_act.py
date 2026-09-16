@@ -95,6 +95,8 @@ class ACTConfig(PreTrainedConfig):
         }
     )
 
+    # Set False to ignore `observation.environment_state` entirely (no-touch baseline on a touch dataset).
+    use_env_state: bool = True
     # Environment-state (e.g. tactile array) path. When `env_state_layout` is set to (sensors, rows, cols),
     # the flat env-state vector is reshaped and encoded by a small conv stem into `env_state_tokens`
     # (rows, cols) pooled tokens per sensor with 2-D positional embeddings, instead of one linear token.
@@ -178,6 +180,10 @@ class ACTConfig(PreTrainedConfig):
 
     def set_dataset_feature_metadata(self, features: dict) -> None:
         """Pick up the env-state layout recorded by `hw_to_dataset_features` (called by make_policy)."""
+        if not self.use_env_state:
+            self.input_features.pop("observation.environment_state", None)
+            self.env_state_layout = None
+            return
         if self.env_state_layout is not None:
             return
         layout = ((features.get("observation.environment_state") or {}).get("info") or {}).get("layout") or {}
