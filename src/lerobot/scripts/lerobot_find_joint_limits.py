@@ -53,6 +53,7 @@ from lerobot.robots import (  # noqa: F401
     openarm_follower,
     rebot_b601_follower,
     so_follower,
+    so_follower_touch,
 )
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
