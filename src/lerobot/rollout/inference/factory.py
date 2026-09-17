@@ -14,7 +14,7 @@
 
 """Inference engine configs and factory.
 
-Selection is explicit via ``--inference.type=sync|rtc``.  Adding a new
+Selection is explicit via ``--inference.type=sync|rtc|async_blend``.  Adding a new
 backend requires registering its config subclass and dispatching it in
 :func:`create_inference_engine`.
 """
@@ -33,6 +33,7 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor import PolicyProcessorPipeline
 
 from ..robot_wrapper import ThreadSafeRobot
+from .async_blend import AsyncBlendInferenceEngine
 from .base import InferenceEngine
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
@@ -79,6 +80,22 @@ class RTCInferenceConfig(InferenceEngineConfig):
 # ---------------------------------------------------------------------------
 
 
+@InferenceEngineConfig.register_subclass("async_blend")
+@dataclass
+class AsyncBlendInferenceConfig(InferenceEngineConfig):
+    """Free-running background inference with an exponential blend of overlapping chunks.
+
+    Built for slow (e.g. CPU) inference of chunked policies such as ACT: the control loop never
+    waits on the policy, and each new chunk is blended into the pending actions instead of
+    replacing them, so the arm does not stall or jump when a chunk lands.
+    """
+
+    # Weight of the newest chunk where it overlaps already-buffered actions (1.0 = replace).
+    blend_weight: float = 0.7
+    # Repeat the last action if the buffer runs dry, instead of skipping the control tick.
+    hold_on_gap: bool = True
+
+
 def create_inference_engine(
     config: InferenceEngineConfig,
     *,
@@ -123,6 +140,20 @@ def create_inference_engine(
             use_torch_compile=use_torch_compile,
             compile_warmup_inferences=compile_warmup_inferences,
             rtc_queue_threshold=config.queue_threshold,
+            shutdown_event=shutdown_event,
+        )
+    if isinstance(config, AsyncBlendInferenceConfig):
+        return AsyncBlendInferenceEngine(
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            robot_wrapper=robot_wrapper,
+            hw_features=hw_features,
+            task=task,
+            fps=fps,
+            device=device,
+            blend_weight=config.blend_weight,
+            hold_on_gap=config.hold_on_gap,
             shutdown_event=shutdown_event,
         )
     raise ValueError(f"Unknown inference engine type: {type(config).__name__}")
