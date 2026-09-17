@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 import draccus
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LambdaLR, LRScheduler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LRScheduler
 
 from lerobot.utils.constants import SCHEDULER_STATE
 from lerobot.utils.import_utils import _diffusers_available, require_package
@@ -103,6 +103,19 @@ class ConstantWithWarmupSchedulerConfig(LRSchedulerConfig):
             return 1.0
 
         return LambdaLR(optimizer, lr_lambda, -1)
+
+
+@LRSchedulerConfig.register_subclass("cosine_annealing")
+@dataclass
+class CosineAnnealingSchedulerConfig(LRSchedulerConfig):
+    """Plain torch CosineAnnealingLR: the peak LR anneals to `min_lr` over `T_max` steps. Used by DOT."""
+
+    num_warmup_steps: int | None = None
+    min_lr: float = 0.0
+    T_max: int = 100000
+
+    def build(self, optimizer: Optimizer, num_training_steps: int) -> CosineAnnealingLR:
+        return CosineAnnealingLR(optimizer, T_max=self.T_max, eta_min=self.min_lr)
 
 
 @LRSchedulerConfig.register_subclass("cosine_annealing_with_warmup")

@@ -23,6 +23,7 @@ from .optimizers import (
     save_optimizer_state,
 )
 from .schedulers import (
+    CosineAnnealingSchedulerConfig as CosineAnnealingSchedulerConfig,
     CosineDecayWithWarmupSchedulerConfig as CosineDecayWithWarmupSchedulerConfig,
     DiffuserSchedulerConfig as DiffuserSchedulerConfig,
     LRSchedulerConfig as LRSchedulerConfig,
@@ -44,6 +45,7 @@ __all__ = [
     "SGDConfig",
     "XVLAAdamWConfig",
     # Scheduler configs
+    "CosineAnnealingSchedulerConfig",
     "CosineDecayWithWarmupSchedulerConfig",
     "DiffuserSchedulerConfig",
     "LRSchedulerConfig",
