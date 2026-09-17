@@ -122,11 +122,18 @@ class DOT(nn.Module):
         self.action_head = nn.Linear(config.dim_model, config.action_feature.shape[0])
 
     def _process_inputs(self, batch: dict[str, Tensor]) -> Tensor:
-        """Project every input to dim_model and concatenate along the token axis."""
+        """Project every input to dim_model and concatenate along the token axis.
+
+        ``batch["_projections"]`` may hold already-projected inputs, ``{name: (B, n_obs, tokens, dim)}``,
+        which are used in place of running that projection (the inference-time image feature cache).
+        """
+        precomputed = batch.get("_projections", {})
         inputs_projections_list = []
         for state in self.projections_names:
             batch_state = self.obs_mapping[state]
-            if batch_state in batch:
+            if state in precomputed:
+                inputs_projections_list.append(precomputed[state].flatten(1, 2))
+            elif batch_state in batch:
                 bs, n_obs, *obs_shape = batch[batch_state].shape
                 enc = self.projections[state](batch[batch_state].reshape(bs * n_obs, *obs_shape)).reshape(
                     bs, n_obs, -1, self.config.dim_model
@@ -188,6 +195,10 @@ class DOTPolicy(PreTrainedPolicy):
     def reset(self):
         self._old_predictions = None
         self._input_buffers = {}
+        # Per-frame backbone features of the image buffer, (B, lookback_obs_steps + 1, n_cam, dim_model),
+        # and which of those slots are up to date. Filled lazily: a frame is encoded at most once.
+        self._image_features = None
+        self._image_features_valid = None
         self.last_action = None
         self.step = 0
 
@@ -203,6 +214,10 @@ class DOTPolicy(PreTrainedPolicy):
         else:
             self._input_buffers[buffer_name] = self._input_buffers[buffer_name].roll(shifts=-1, dims=1)
             self._input_buffers[buffer_name][:, -1] = observation
+            if buffer_name == "images" and self._image_features_valid is not None:
+                self._image_features = self._image_features.roll(shifts=-1, dims=1)
+                self._image_features_valid = self._image_features_valid.roll(shifts=-1, dims=0)
+                self._image_features_valid[-1] = False
 
         return torch.cat(
             [
@@ -229,6 +244,30 @@ class DOTPolicy(PreTrainedPolicy):
             )  # (B, n_obs * n_cam, C, H, W), same order as training
         return batch
 
+    def _cached_image_projections(self) -> Tensor:
+        """Backbone features for the [lookback, recent n_obs_steps - 1] image frames, (B, n_obs * n_cam, 1, dim).
+
+        Every frame in the raw image buffer was already seen on an earlier tick, so its features are
+        cached and only the slots that changed since (normally just the newest frame) go through the
+        backbone. Output matches projecting the raw frames directly, just without the redundant passes.
+        """
+        raw = self._input_buffers["images"]  # (B, lookback + 1, n_cam, C, H, W)
+        bs, n_slots, n_cam = raw.shape[:3]
+        proj = self.model.projections["images"]
+        if self._image_features_valid is None:
+            self._image_features = raw.new_zeros(bs, n_slots, n_cam, self.config.dim_model)
+            self._image_features_valid = torch.zeros(n_slots, dtype=torch.bool, device=raw.device)
+
+        needed = [0] + list(range(n_slots - (self.config.n_obs_steps - 1), n_slots))
+        stale = [i for i in needed if not self._image_features_valid[i]]
+        if stale:
+            frames = raw[:, stale].flatten(0, 2)  # (B * len(stale) * n_cam, C, H, W)
+            feats = proj(frames).reshape(bs, len(stale), n_cam, -1)
+            self._image_features[:, stale] = feats
+            self._image_features_valid[stale] = True
+
+        return self._image_features[:, needed].flatten(1, 2).unsqueeze(2)
+
     def _chunk_actions(self, actions: Tensor) -> Tensor:
         """Exponentially weighted average of the overlapping predictions for the current step."""
         if self._old_predictions is not None:
@@ -245,6 +284,8 @@ class DOTPolicy(PreTrainedPolicy):
         """Predict `inference_horizon` (normalized) actions; also advances the observation buffers."""
         self.eval()
         batch = self._prepare_batch_for_inference(batch)
+        if OBS_IMAGES in batch:
+            batch["_projections"] = {"images": self._cached_image_projections()}
         return self.model(batch)[:, -self.config.inference_horizon :]
 
     @torch.no_grad()
