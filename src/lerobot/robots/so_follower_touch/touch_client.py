@@ -144,6 +144,8 @@ class TouchClient:
             ser.write(b"\x03\x04")  # restart the Pico's main.py so identify/enable run fresh
             self._ser = ser
             silent = 0
+            identified = False  # saw an I<idx> line since the restart above
+            restart_at = time.monotonic()
             while not self._stop.is_set():
                 try:
                     line = ser.readline()
@@ -157,6 +159,11 @@ class TouchClient:
                         silent = 0
                     continue
                 silent = 0
+                if not identified and time.monotonic() - restart_at > 1.0:
+                    # Frames are flowing but the restart never took (bytes written right after a CDC open
+                    # can be dropped): send it once more so identify/enable run fresh.
+                    ser.write(b"\x03\x04")
+                    identified = True
                 kind, _, rest = line.strip().partition(b" ")
                 if len(kind) != 2 or not (0x30 <= kind[1] < 0x30 + self.num_sensors):
                     continue
@@ -165,7 +172,9 @@ class TouchClient:
                     if kind[0:1] == b"D":
                         p = bytes.fromhex(rest.decode())
                         self._store(idx, struct.unpack(f"<{len(p) // 2}h", p))
+                        self.present[idx] = True  # a delta frame is proof of life even without an I line
                     elif kind[0:1] == b"I":
+                        identified = True
                         self.present[idx], self.parts[idx] = True, rest.decode()
                     elif kind[0:1] == b"X":
                         self.present[idx] = False
