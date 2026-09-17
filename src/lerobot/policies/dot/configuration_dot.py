@@ -93,6 +93,9 @@ class DOTConfig(PreTrainedConfig):
     train_alpha: float = 0.9
     predict_every_n: int = 1
     return_every_n: int = 1
+    # Inference-only: run this ONNX export (2026-09-17-dot-policy/torq/export_dot_onnx.py, the cached-embedding
+    # graph) through onnxruntime instead of the torch model. Same weights and math, ~3x faster on CPU.
+    onnx_path: str | None = None
 
     # Training preset
     optimizer_lr: float = 1.0e-4

@@ -18,8 +18,12 @@ projected to `dim_model` and fed as memory to a plain `nn.TransformerDecoder` wh
 sinusoidal positional encodings for the action horizon. Non-generative, L1 loss, LoRA on the ResNet.
 """
 
+import logging
 import math
+import os
+from collections import deque
 
+import numpy as np
 import torch
 import torchvision
 from torch import Tensor, nn
@@ -190,15 +194,18 @@ class DOTPolicy(PreTrainedPolicy):
             config.rescale_shape, interpolation=InterpolationMode.NEAREST
         )
 
+        self._ort = None  # onnxruntime session, created on first use when config.onnx_path is set
         self.reset()
 
     def reset(self):
         self._old_predictions = None
         self._input_buffers = {}
-        # Per-frame backbone features of the image buffer, (B, lookback_obs_steps + 1, n_cam, dim_model),
-        # and which of those slots are up to date. Filled lazily: a frame is encoded at most once.
-        self._image_features = None
-        self._image_features_valid = None
+        # Image history for inference: one entry per tick, each (B, n_cam, C, H, W) already resized, kept for
+        # the last lookback_obs_steps + 1 ticks (a deque, so a tick costs no copy of the whole history),
+        # with the backbone features of the same ticks alongside, (B, n_cam, dim_model) or None until a
+        # frame is encoded. A frame is encoded at most once; ticks skipped by predict_every_n never are.
+        self._frames: deque[Tensor] | None = None
+        self._frame_features: deque[Tensor | None] | None = None
         self.last_action = None
         self.step = 0
 
@@ -214,10 +221,6 @@ class DOTPolicy(PreTrainedPolicy):
         else:
             self._input_buffers[buffer_name] = self._input_buffers[buffer_name].roll(shifts=-1, dims=1)
             self._input_buffers[buffer_name][:, -1] = observation
-            if buffer_name == "images" and self._image_features_valid is not None:
-                self._image_features = self._image_features.roll(shifts=-1, dims=1)
-                self._image_features_valid = self._image_features_valid.roll(shifts=-1, dims=0)
-                self._image_features_valid[-1] = False
 
         return torch.cat(
             [
@@ -227,46 +230,48 @@ class DOTPolicy(PreTrainedPolicy):
             dim=1,
         )
 
+    def _push_frames(self, frames: Tensor) -> None:
+        """Append this tick's resized camera frames (B, n_cam, C, H, W) to the image history."""
+        n = self.config.lookback_obs_steps + 1
+        if self._frames is None:  # same as the state buffers: the first observation fills the whole history
+            self._frames = deque([frames] * n, maxlen=n)
+            self._frame_features = deque([None] * n, maxlen=n)
+        else:
+            self._frames.append(frames)
+            self._frame_features.append(None)
+
+    def _history_slots(self) -> list[int]:
+        """Indices into the image history the model reads: [lookback, recent n_obs_steps - 1], oldest first."""
+        n = self.config.lookback_obs_steps + 1
+        return [0] + list(range(n - (self.config.n_obs_steps - 1), n))
+
     def _prepare_batch_for_inference(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         batch = dict(batch)  # shallow copy: we add keys
         if len(self.image_names) > 0:
-            batch[OBS_IMAGES] = torch.stack(
-                [self.resize_transform(batch[k]) for k in self.image_names], dim=1
-            )
-            # (B, n_cam, C, H, W)
+            self._push_frames(torch.stack([self.resize_transform(batch[k]) for k in self.image_names], dim=1))
+            batch.pop(OBS_IMAGES, None)  # image tokens come from _cached_image_projections instead
 
         for name, batch_name in self.model.obs_mapping.items():
-            batch[batch_name] = self._update_observation_buffers(name, batch[batch_name])
-
-        if OBS_IMAGES in batch:
-            batch[OBS_IMAGES] = batch[OBS_IMAGES].flatten(
-                1, 2
-            )  # (B, n_obs * n_cam, C, H, W), same order as training
+            if name != "images":
+                batch[batch_name] = self._update_observation_buffers(name, batch[batch_name])
         return batch
 
-    def _cached_image_projections(self) -> Tensor:
-        """Backbone features for the [lookback, recent n_obs_steps - 1] image frames, (B, n_obs * n_cam, 1, dim).
+    def _encode_frames(self, frames: Tensor) -> Tensor:
+        """Backbone features of one tick's frames: (B, n_cam, C, H, W) -> (B, n_cam, dim_model)."""
+        bs, n_cam = frames.shape[:2]
+        return self.model.projections["images"](frames.flatten(0, 1)).reshape(bs, n_cam, -1)
 
-        Every frame in the raw image buffer was already seen on an earlier tick, so its features are
-        cached and only the slots that changed since (normally just the newest frame) go through the
-        backbone. Output matches projecting the raw frames directly, just without the redundant passes.
+    def _cached_image_projections(self, encode=None) -> Tensor:
+        """Image tokens for the model, (B, n_obs * n_cam, 1, dim), obs-major like training.
+
+        Only history slots without cached features (normally just this tick's frames) go through
+        ``encode`` (default: the torch backbone). Output matches projecting all frames directly.
         """
-        raw = self._input_buffers["images"]  # (B, lookback + 1, n_cam, C, H, W)
-        bs, n_slots, n_cam = raw.shape[:3]
-        proj = self.model.projections["images"]
-        if self._image_features_valid is None:
-            self._image_features = raw.new_zeros(bs, n_slots, n_cam, self.config.dim_model)
-            self._image_features_valid = torch.zeros(n_slots, dtype=torch.bool, device=raw.device)
-
-        needed = [0] + list(range(n_slots - (self.config.n_obs_steps - 1), n_slots))
-        stale = [i for i in needed if not self._image_features_valid[i]]
-        if stale:
-            frames = raw[:, stale].flatten(0, 2)  # (B * len(stale) * n_cam, C, H, W)
-            feats = proj(frames).reshape(bs, len(stale), n_cam, -1)
-            self._image_features[:, stale] = feats
-            self._image_features_valid[stale] = True
-
-        return self._image_features[:, needed].flatten(1, 2).unsqueeze(2)
+        encode = encode or self._encode_frames
+        for i in self._history_slots():
+            if self._frame_features[i] is None:
+                self._frame_features[i] = encode(self._frames[i])
+        return torch.stack([self._frame_features[i] for i in self._history_slots()], dim=1).flatten(1, 2).unsqueeze(2)
 
     def _chunk_actions(self, actions: Tensor) -> Tensor:
         """Exponentially weighted average of the overlapping predictions for the current step."""
@@ -283,10 +288,67 @@ class DOTPolicy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         """Predict `inference_horizon` (normalized) actions; also advances the observation buffers."""
         self.eval()
+        if self.config.onnx_path:
+            return self._predict_action_chunk_onnx(batch)
         batch = self._prepare_batch_for_inference(batch)
-        if OBS_IMAGES in batch:
+        if len(self.image_names) > 0:
             batch["_projections"] = {"images": self._cached_image_projections()}
         return self.model(batch)[:, -self.config.inference_horizon :]
+
+    # --- onnxruntime backend -------------------------------------------------------------------------
+    # The export (export_dot_onnx.py) takes the two NEW camera frames plus the four older 128-d image
+    # embeddings, and returns the action chunk and the new embeddings, so the same feature ring buffer
+    # as _cached_image_projections is kept here, just filled by the graph instead of the torch backbone.
+
+    def _ort_session(self):
+        if self._ort is None:
+            import onnxruntime as ort
+
+            opts = ort.SessionOptions()
+            # torch's OpenMP pool busy-waits after every op; with the default thread count it more than
+            # doubles the time of the ORT run that follows (52 -> 131 ms/tick measured). The remaining
+            # torch work per tick (normalizers, a few small tensor ops) does not need the threads.
+            torch.set_num_threads(1)
+            opts.intra_op_num_threads = max(2, (os.cpu_count() or 4) - 4)
+            logging.info(
+                f"DOT: onnxruntime backend {self.config.onnx_path} ({opts.intra_op_num_threads} threads), torch threads=1"
+            )
+            self._ort = ort.InferenceSession(self.config.onnx_path, opts, providers=["CPUExecutionProvider"])
+            cams = [k.rsplit(".", 1)[-1] for k in self.image_names]
+            expected = [f"image_{c}" for c in cams] + ["past_img_emb", "state", "env_state"]
+            names = [i.name for i in self._ort.get_inputs()]
+            if names != expected:
+                raise ValueError(f"{self.config.onnx_path}: inputs {names} do not match this policy's {expected}")
+            self._ort_image_inputs = names[: len(cams)]
+        return self._ort
+
+    def _ort_run(self, frames: Tensor, past: Tensor, state: Tensor, env_state: Tensor) -> tuple[Tensor, Tensor]:
+        """frames (1, n_cam, C, H, W), past (n_past, dim), state (1, n_obs, D), env (1, n_obs, E)
+        -> action (1, H, A), features (1, n_cam, dim)."""
+        sess = self._ort_session()
+        feeds = {name: frames[:, i] for i, name in enumerate(self._ort_image_inputs)}
+        feeds.update(past_img_emb=past.unsqueeze(0), state=state, env_state=env_state)
+        feeds = {k: np.ascontiguousarray(v.numpy(), dtype=np.float32) for k, v in feeds.items()}
+        action, emb = sess.run(None, feeds)
+        return torch.from_numpy(action), torch.from_numpy(emb)
+
+    def _predict_action_chunk_onnx(self, batch: dict[str, Tensor]) -> Tensor:
+        batch = self._prepare_batch_for_inference(batch)
+        if OBS_ENV_STATE not in batch:
+            raise ValueError("the DOT ONNX export expects an environment_state input")
+        state, env = batch[OBS_STATE], batch[OBS_ENV_STATE]
+        if state.shape[0] != 1:
+            raise ValueError("onnx_path inference supports batch size 1 only")
+        slots = self._history_slots()
+        n_past = (len(slots) - 1) * len(self.image_names)
+        zeros = torch.zeros(n_past, self.config.dim_model)
+        for i in slots[:-1]:  # only after ticks skipped by predict_every_n: encode the frames we missed
+            if self._frame_features[i] is None:
+                self._frame_features[i] = self._ort_run(self._frames[i], zeros, state, env)[1]
+        past = torch.cat([self._frame_features[i] for i in slots[:-1]], dim=1).reshape(n_past, -1)
+        action, emb = self._ort_run(self._frames[-1], past, state, env)
+        self._frame_features[-1] = emb
+        return action
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
