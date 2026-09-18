@@ -24,6 +24,8 @@ its writes live in the same method.
 """
 
 import logging
+import shutil
+from collections.abc import Callable
 from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -55,6 +57,8 @@ from lerobot.optim import (
 from lerobot.policies import PreTrainedPolicy
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import (
+    BEST_CHECKPOINT_DIR,
+    BEST_CHECKPOINT_FILENAME,
     CHECKPOINTS_DIR,
     LAST_CHECKPOINT_LINK,
     PRETRAINED_MODEL_DIR,
@@ -240,7 +244,31 @@ def save_checkpoint(
             used to unwrap the model and required on sharded runs, where it owns the DCP save
             channels. Defaults to None (plain single-process saves).
     """
-    pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
+    policy_to_save, sharded = save_pretrained_model(
+        checkpoint_dir / PRETRAINED_MODEL_DIR, cfg, policy, preprocessor, postprocessor, accelerator
+    )
+    save_training_state(
+        checkpoint_dir, step, cfg, optimizer, scheduler, accelerator, sharded=sharded, model=policy_to_save
+    )
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+
+
+def save_pretrained_model(
+    pretrained_dir: Path,
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    preprocessor: PolicyProcessorPipeline | None = None,
+    postprocessor: PolicyProcessorPipeline | None = None,
+    accelerator: "Accelerator | None" = None,
+) -> tuple[PreTrainedPolicy, bool]:
+    """Write the `pretrained_model/` part of a checkpoint (weights + policy/train/processor configs).
+
+    Collective: MUST be called on every rank; rank-0-only writes are gated internally.
+
+    Returns:
+        The unwrapped policy that was saved and whether it is a sharded module.
+    """
     fmt = cfg.checkpoint_format
     policy_to_save = accelerator.unwrap_model(policy) if accelerator is not None else policy
     sharded = is_sharded_module(policy_to_save)
@@ -272,12 +300,67 @@ def save_checkpoint(
             preprocessor.save_pretrained(pretrained_dir)
         if postprocessor is not None:
             postprocessor.save_pretrained(pretrained_dir)
+    return policy_to_save, sharded
 
-    save_training_state(
-        checkpoint_dir, step, cfg, optimizer, scheduler, accelerator, sharded=sharded, model=policy_to_save
-    )
+
+def get_best_checkpoint_dir(output_dir: Path) -> Path:
+    """Returns `output_dir/checkpoints/best`, where the lowest-eval-loss model is kept."""
+    return output_dir / CHECKPOINTS_DIR / BEST_CHECKPOINT_DIR
+
+
+def load_best_checkpoint_metadata(output_dir: Path) -> dict[str, Any] | None:
+    """Returns the `{"step", "eval_loss"}` record of the best checkpoint, or None if there is none."""
+    path = get_best_checkpoint_dir(output_dir) / BEST_CHECKPOINT_FILENAME
+    return load_json(path) if path.is_file() else None
+
+
+def save_best_checkpoint(
+    output_dir: Path,
+    step: int,
+    eval_loss: float,
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    preprocessor: PolicyProcessorPipeline | None = None,
+    postprocessor: PolicyProcessorPipeline | None = None,
+    accelerator: "Accelerator | None" = None,
+    extra_writer: "Callable[[Path], None] | None" = None,
+) -> Path:
+    """Replace `checkpoints/best/` with the current model (no optimizer state).
+
+    Layout: `best/pretrained_model/` as in a step checkpoint, plus `best/best_checkpoint.json`
+    holding the step and eval loss. The new tree is written next to the old one and swapped in by
+    rename, so an interrupted save never leaves a half-written best checkpoint.
+
+    Collective: MUST be called on every rank. `extra_writer(best_tmp_dir)` runs on the main
+    process only, for run-specific additions such as an EMA copy of the weights.
+
+    Returns:
+        Path: The best checkpoint directory.
+    """
+    best_dir = get_best_checkpoint_dir(output_dir)
+    tmp_dir = best_dir.with_name(best_dir.name + ".tmp")
+    old_dir = best_dir.with_name(best_dir.name + ".old")
+    if is_main_process():
+        for stale in (tmp_dir, old_dir):
+            if stale.exists():
+                shutil.rmtree(stale)
     if accelerator is not None:
         accelerator.wait_for_everyone()
+    save_pretrained_model(
+        tmp_dir / PRETRAINED_MODEL_DIR, cfg, policy, preprocessor, postprocessor, accelerator
+    )
+    if is_main_process():
+        if extra_writer is not None:
+            extra_writer(tmp_dir)
+        write_json({"step": step, "eval_loss": eval_loss}, tmp_dir / BEST_CHECKPOINT_FILENAME)
+        if best_dir.exists():
+            best_dir.rename(old_dir)
+        tmp_dir.rename(best_dir)
+        if old_dir.exists():
+            shutil.rmtree(old_dir)
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+    return best_dir
 
 
 def save_training_state(

@@ -34,6 +34,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -48,11 +49,13 @@ from tqdm import tqdm
 from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
+    load_best_checkpoint_metadata,
     load_training_metadata,
     publish_trained_model,
     push_checkpoint_to_hub,
     resume_after_prepare,
     resume_before_prepare,
+    save_best_checkpoint,
     save_checkpoint,
     should_save_checkpoint,
     update_last_checkpoint,
@@ -564,8 +567,11 @@ def train(cfg: TrainPipelineConfig):
 
     # --- resume phase 1 + dataloaders ----------------------------------------------------------
     step = 0  # number of loop steps (= micro-batches consumed per data-parallel worker)
+    best_eval_loss = float("inf")
     if cfg.resume:
         step = resume_before_prepare(cfg)  # step + RNG only; sharded state loads after prepare
+        if cfg.save_best_checkpoint and (best := load_best_checkpoint_metadata(cfg.output_dir)) is not None:
+            best_eval_loss = best["eval_loss"]
 
     dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, step, parallel_dims)
 
@@ -812,6 +818,35 @@ def train(cfg: TrainPipelineConfig):
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+
+            if cfg.save_best_checkpoint and eval_loss < best_eval_loss:
+                best_eval_loss = eval_loss
+                if is_main_process():
+                    logging.info(f"step {step}: new best eval_loss={eval_loss:.4f}, saving best checkpoint")
+
+                def _write_ema_copy(best_tmp_dir: Path) -> None:
+                    # Mirror the step checkpoints: a directly loadable copy of the EMA weights.
+                    if ema is None:
+                        return
+                    unwrapped_policy = accelerator.unwrap_model(policy)
+                    ema_dir = best_tmp_dir / f"{PRETRAINED_MODEL_DIR}_ema"
+                    with _ema_weights(ema, unwrapped_policy):
+                        unwrapped_policy.save_pretrained(ema_dir)
+                        cfg.save_pretrained(ema_dir)
+                        preprocessor.save_pretrained(ema_dir)
+                        postprocessor.save_pretrained(ema_dir)
+
+                save_best_checkpoint(
+                    cfg.output_dir,
+                    step,
+                    eval_loss,
+                    cfg,
+                    policy,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    accelerator=accelerator,
+                    extra_writer=_write_ema_copy,
+                )
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file
