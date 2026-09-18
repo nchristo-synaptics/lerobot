@@ -184,8 +184,9 @@ class ACTConfig(PreTrainedConfig):
     def set_dataset_feature_metadata(self, features: dict) -> None:
         """Pick up the env-state layout recorded by `hw_to_dataset_features` (called by make_policy)."""
         for key in self.drop_input_features:
-            if self.input_features.pop(key, None) is None:
-                raise ValueError(f"drop_input_features: {key!r} is not an input feature ({list(self.input_features)})")
+            # Already absent on resume (the saved config has it dropped); only a key the dataset lacks is an error.
+            if self.input_features.pop(key, None) is None and key not in features:
+                raise ValueError(f"drop_input_features: {key!r} is not a dataset feature ({list(features)})")
         if not self.use_env_state:
             self.input_features.pop("observation.environment_state", None)
             self.env_state_layout = None
