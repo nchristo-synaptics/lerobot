@@ -152,6 +152,9 @@ class TrainPipelineConfig(HubMixin):
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     # A non-positive value disables periodic saving, keeping only the final checkpoint.
     save_freq: int = 20_000
+    # Also keep the model with the lowest eval loss in `checkpoints/best/` (model + processors,
+    # no optimizer state), rewritten whenever an eval improves. Requires eval_steps > 0.
+    save_best_checkpoint: bool = False
     # Model-artifact format inside checkpoints; non-default values require a sharded run.
     checkpoint_format: CheckpointFormat = CheckpointFormat.SAFETENSORS
     use_policy_training_preset: bool = True
@@ -317,6 +320,8 @@ class TrainPipelineConfig(HubMixin):
 
         if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
+        if self.save_best_checkpoint and self.eval_steps <= 0:
+            raise ValueError("save_best_checkpoint requires eval_steps > 0 to measure the eval loss.")
 
         # Remote runs auto-generate the repo_id in submit_to_hf (the policy may only be
         # resolved here, from --policy.path), so don't demand it up front for them.

@@ -20,10 +20,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from lerobot.common.train_utils import (
+    get_best_checkpoint_dir,
     get_step_checkpoint_dir,
     get_step_identifier,
+    load_best_checkpoint_metadata,
     load_training_metadata,
     push_checkpoint_to_hub,
+    save_best_checkpoint,
     save_training_metadata,
     save_training_state,
     should_save_checkpoint,
@@ -32,6 +35,8 @@ from lerobot.common.train_utils import (
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.constants import (
+    BEST_CHECKPOINT_DIR,
+    BEST_CHECKPOINT_FILENAME,
     CHECKPOINTS_DIR,
     LAST_CHECKPOINT_LINK,
     OPTIMIZER_PARAM_GROUPS,
@@ -180,3 +185,51 @@ def test_resolve_resume_checkpoint_raises_without_checkpoints(tmp_path, monkeypa
     monkeypatch.setattr("lerobot.common.train_utils.find_latest_hub_checkpoint", lambda repo_id: None)
     with pytest.raises(FileNotFoundError, match="No checkpoint"):
         train_utils.resolve_resume_checkpoint("u/run", tmp_path / "run")
+
+
+def test_get_best_checkpoint_dir(tmp_path):
+    assert get_best_checkpoint_dir(tmp_path) == tmp_path / CHECKPOINTS_DIR / BEST_CHECKPOINT_DIR
+
+
+def test_load_best_checkpoint_metadata_missing(tmp_path):
+    assert load_best_checkpoint_metadata(tmp_path) is None
+
+
+def _best_checkpoint_fixtures(tmp_path):
+    cfg = MagicMock()
+    cfg.peft = None
+    cfg.checkpoint_format.wants_safetensors = True
+    cfg.checkpoint_format.wants_dcp = False
+    cfg.save_pretrained = lambda d: (d / "train_config.json").write_text("{}")
+    policy = MagicMock()
+    policy.save_pretrained = lambda d: (
+        Path(d).mkdir(parents=True, exist_ok=True),
+        (Path(d) / "model.safetensors").write_text("w"),
+    )
+    return cfg, policy
+
+
+def test_save_best_checkpoint_writes_model_and_metadata(tmp_path):
+    cfg, policy = _best_checkpoint_fixtures(tmp_path)
+    extra = []
+    best = save_best_checkpoint(tmp_path, 100, 0.5, cfg, policy, extra_writer=lambda d: extra.append(d))
+    assert best == get_best_checkpoint_dir(tmp_path)
+    assert (best / "pretrained_model" / "model.safetensors").read_text() == "w"
+    assert (best / "pretrained_model" / "train_config.json").is_file()
+    assert load_best_checkpoint_metadata(tmp_path) == {"step": 100, "eval_loss": 0.5}
+    assert extra == [best.with_name(best.name + ".tmp")]
+    assert not best.with_name(best.name + ".tmp").exists()
+
+
+def test_save_best_checkpoint_replaces_previous_best(tmp_path):
+    cfg, policy = _best_checkpoint_fixtures(tmp_path)
+    best = save_best_checkpoint(tmp_path, 100, 0.5, cfg, policy)
+    (best / "leftover.txt").write_text("from the old best")
+    # A stale tmp dir from an interrupted save must not break the next one.
+    best.with_name(best.name + ".tmp").mkdir()
+    save_best_checkpoint(tmp_path, 200, 0.4, cfg, policy)
+    assert load_best_checkpoint_metadata(tmp_path) == {"step": 200, "eval_loss": 0.4}
+    assert not (best / "leftover.txt").exists()
+    assert not best.with_name(best.name + ".old").exists()
+    assert not best.with_name(best.name + ".tmp").exists()
+    assert (best / BEST_CHECKPOINT_FILENAME).is_file()

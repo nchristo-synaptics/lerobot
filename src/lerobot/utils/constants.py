@@ -48,6 +48,8 @@ TELEOPERATORS = "teleoperators"
 # files & directories
 CHECKPOINTS_DIR = "checkpoints"
 LAST_CHECKPOINT_LINK = "last"
+BEST_CHECKPOINT_DIR = "best"
+BEST_CHECKPOINT_FILENAME = "best_checkpoint.json"
 PRETRAINED_MODEL_DIR = "pretrained_model"
 TRAINING_STATE_DIR = "training_state"
 ALGORITHM_DIR = "algorithm"
